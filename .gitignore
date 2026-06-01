@@ -1,0 +1,20 @@
+﻿# Node modules
+backend/node_modules/
+frontend/node_modules/
+
+# Variables de entorno (contienen contraseñas y API keys)
+backend/.env
+frontend/.env
+
+# Logs
+backend/logs/
+*.log
+
+# Build
+frontend/.output/
+frontend/dist/
+frontend/.vinxi/
+
+# OS
+.DS_Store
+Thumbs.db
