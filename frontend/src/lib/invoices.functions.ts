@@ -12,7 +12,6 @@ const ExtractInput = z.object({
 
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:3001";
 
-
 export const extractInvoice = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => ExtractInput.parse(input))
@@ -46,8 +45,11 @@ export const extractInvoice = createServerFn({ method: "POST" })
         invoice_date: result.resumen?.fecha ?? null,
         total: result.resumen?.total ?? null,
         currency: result.resumen?.moneda ?? null,
+        ruc: result.resumen?.ruc ?? null,
         thread_id: data.threadId,
         extracted: result.resumen,
+        sunat: result.sunat ?? null,
+        advertencia_sunat: result.advertencia_sunat ?? null,
       }
     };
   });

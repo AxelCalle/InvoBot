@@ -1,6 +1,7 @@
 import { createFileRoute, Outlet, useNavigate } from "@tanstack/react-router";
 import { useEffect } from "react";
 import { useAuth } from "@/lib/auth";
+import { useSessionTimeout } from "@/lib/session";
 
 export const Route = createFileRoute("/_authenticated")({
   component: AuthenticatedLayout,
@@ -9,6 +10,11 @@ export const Route = createFileRoute("/_authenticated")({
 function AuthenticatedLayout() {
   const auth = useAuth();
   const navigate = useNavigate();
+
+  useSessionTimeout(() => {
+    auth.signOut();
+    navigate({ to: "/login", replace: true });
+  });
 
   useEffect(() => {
     if (!auth.isLoading && !auth.isAuthenticated) {
@@ -19,7 +25,7 @@ function AuthenticatedLayout() {
   if (auth.isLoading || !auth.isAuthenticated) {
     return (
       <div className="flex min-h-screen items-center justify-center text-sm text-muted-foreground">
-        Loading…
+        Cargando…
       </div>
     );
   }

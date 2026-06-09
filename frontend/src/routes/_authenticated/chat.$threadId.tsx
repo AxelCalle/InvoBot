@@ -15,7 +15,7 @@ export const Route = createFileRoute("/_authenticated/chat/$threadId")({
 
 const ACCEPT = ".pdf,.xml,.jpg,.jpeg,.png,application/pdf,text/xml,application/xml,image/jpeg,image/png";
 const MAX_BYTES = 20 * 1024 * 1024;
-const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
+const BACKEND_URL = "http://localhost:3001";
 
 type Empresa = { id: number; codigo: string; nombre: string };
 type Area = { id: number; codigo: string; nombre: string };
@@ -98,6 +98,18 @@ function ChatThreadPage() {
   const messages = thread?.messages ?? [];
   const isSpanish = (t: string) => /[áéíóúñ¿¡]/i.test(t) || !t.trim();
 
+  const resetFlow = (mensaje?: string) => {
+    setEmpresaSeleccionada(null);
+    setAreaSeleccionada(null);
+    setStep("esperando_empresa");
+    threadsStore.appendMessage(threadId, {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      text: mensaje || "¿Deseas registrar otra factura? ¿A qué empresa corresponde?",
+      createdAt: Date.now(),
+    });
+  };
+
   const verificarPresupuesto = async (empresaId: number, areaId: number) => {
     try {
       const token = localStorage.getItem("invoicegg_token");
@@ -134,7 +146,6 @@ function ChatThreadPage() {
 
       const token = localStorage.getItem("invoicegg_token");
 
-      // Vincular factura a empresa y área
       await fetch(`${BACKEND_URL}/api/facturas/vincular`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
@@ -147,8 +158,6 @@ function ChatThreadPage() {
         }),
       });
 
-      // Obtener total real desde SQL Server
-      // El número en BD se guarda como serie+numero sin guión ej: F001001988
       const numeroFactura = (inv?.invoice_number || "").replace(/-/g, "");
       const totalRes = await fetch(
         `${BACKEND_URL}/api/facturas/total/${encodeURIComponent(numeroFactura)}`,
@@ -165,9 +174,11 @@ function ChatThreadPage() {
       ].filter(Boolean).join(" · ");
 
       const alerta = await verificarPresupuesto(empresa.id, area.id);
+      const advertenciaSunat = inv?.advertencia_sunat || null;
 
       let texto = `✅ Factura registrada en *${empresa.nombre}* — *${area.nombre}*.\n${summary || ""}`;
       if (alerta) texto += `\n\n${alerta}`;
+      if (advertenciaSunat) texto += `\n\n${advertenciaSunat}`;
 
       threadsStore.appendMessage(threadId, {
         id: crypto.randomUUID(),
@@ -178,53 +189,29 @@ function ChatThreadPage() {
       });
       toast.success("Factura registrada correctamente");
 
-      // Reiniciar para siguiente factura
-      setTimeout(() => {
-        iniciado.current = false;
-        setStep("esperando_empresa");
-        setEmpresaSeleccionada(null);
-        setAreaSeleccionada(null);
-        threadsStore.appendMessage(threadId, {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          text: "¿Deseas registrar otra factura? ¿A qué empresa corresponde?",
-          createdAt: Date.now(),
-        });
-      }, 1000);
+      setTimeout(() => resetFlow("¿Deseas registrar otra factura? ¿A qué empresa corresponde?"), 1500);
 
     } catch (err) {
-    const msg = err instanceof Error ? err.message : "Error al procesar";
-    const esDuplicado = msg.includes("409") || msg.includes("ya fue registrado");
-    const esIlegible = msg.includes("422") || msg.includes("datos mínimos");
+      const msg = err instanceof Error ? err.message : "Error al procesar";
+      const esDuplicado = msg.includes("409") || msg.includes("ya fue registrado");
+      const esIlegible = msg.includes("422") || msg.includes("datos mínimos");
 
-    const texto = esDuplicado
-      ? "⚠️ Esta factura ya fue registrada anteriormente en el sistema. No se realizó un registro duplicado."
-      : esIlegible
-      ? "📄 No pude leer correctamente el documento. Intenta con una imagen más nítida o en formato PDF."
-      : `❌ Ocurrió un error al procesar la factura. Por favor intenta nuevamente.`;
+      const texto = esDuplicado
+        ? "⚠️ Esta factura ya fue registrada anteriormente en el sistema. No se realizó un registro duplicado."
+        : esIlegible
+        ? "📄 No pude leer correctamente el documento. Intenta con una imagen más nítida o en formato PDF."
+        : "❌ Ocurrió un error al procesar la factura. Por favor intenta nuevamente.";
 
-    threadsStore.appendMessage(threadId, {
-      id: crypto.randomUUID(),
-      role: "assistant",
-      text: texto,
-      createdAt: Date.now(),
-    });
-
-    // Reiniciar flujo para intentar con otra factura
-    setTimeout(() => {
-      iniciado.current = false;
-      setStep("esperando_empresa");
-      setEmpresaSeleccionada(null);
-      setAreaSeleccionada(null);
       threadsStore.appendMessage(threadId, {
         id: crypto.randomUUID(),
         role: "assistant",
-        text: "¿Deseas registrar otra factura? ¿A qué empresa corresponde?",
+        text: texto,
         createdAt: Date.now(),
       });
-    }, 1000);
+      toast.error(esDuplicado ? "Factura duplicada" : "Error al procesar");
 
-    toast.error(esDuplicado ? "Factura duplicada" : "Error al procesar");
+      setTimeout(() => resetFlow("¿Deseas intentar con otra factura? ¿A qué empresa corresponde?"), 1500);
+
     } finally {
       setBusy(false);
     }
@@ -314,16 +301,16 @@ function ChatThreadPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="border-b px-6 py-3">
-        <h2 className="text-sm font-semibold">{thread?.title || "Conversación"}</h2>
-        <p className="text-xs text-muted-foreground">
+      <header className="border-b px-3 md:px-6 py-2 md:py-3">
+        <h2 className="text-sm font-semibold truncate">{thread?.title || "Conversación"}</h2>
+        <p className="text-xs text-muted-foreground hidden md:block">
           Sube facturas en PDF, JPG, PNG o XML. InvoBot las lee y guarda los datos automáticamente.
         </p>
       </header>
 
       <div
         ref={scrollRef}
-        className="flex-1 overflow-y-auto px-6 py-6"
+        className="flex-1 overflow-y-auto px-3 md:px-6 py-4 md:py-6"
         style={{
           backgroundImage: "url('/fondo-chat.jpg')",
           backgroundSize: "300%",
@@ -331,16 +318,16 @@ function ChatThreadPage() {
           backgroundAttachment: "fixed",
         }}
       >
-        <div className="mx-auto flex max-w-3xl flex-col gap-6">
+        <div className="mx-auto flex max-w-3xl flex-col gap-4 md:gap-6">
           {messages.map((m) => <Bubble key={m.id} m={m} />)}
 
           {step === "esperando_empresa" && (
-            <div className="flex flex-wrap gap-2 pl-10">
+            <div className="flex flex-wrap gap-2 pl-0 md:pl-10">
               {empresas.map((e) => (
                 <button
                   key={e.id}
                   onClick={() => seleccionarEmpresa(e)}
-                  className="rounded-full border border-blue-300 bg-white/90 px-4 py-1.5 text-sm font-medium text-blue-700 hover:bg-blue-50 backdrop-blur-sm shadow-sm"
+                  className="rounded-full border border-blue-300 bg-white/90 px-3 py-1.5 text-xs md:text-sm font-medium text-blue-700 hover:bg-blue-50 backdrop-blur-sm shadow-sm"
                 >
                   {e.nombre}
                 </button>
@@ -349,12 +336,12 @@ function ChatThreadPage() {
           )}
 
           {step === "esperando_area" && (
-            <div className="flex flex-wrap gap-2 pl-10">
+            <div className="flex flex-wrap gap-2 pl-0 md:pl-10">
               {areas.map((a) => (
                 <button
                   key={a.id}
                   onClick={() => seleccionarArea(a)}
-                  className="rounded-full border border-blue-300 bg-white/90 px-4 py-1.5 text-sm font-medium text-blue-700 hover:bg-blue-50 backdrop-blur-sm shadow-sm"
+                  className="rounded-full border border-blue-300 bg-white/90 px-3 py-1.5 text-xs md:text-sm font-medium text-blue-700 hover:bg-blue-50 backdrop-blur-sm shadow-sm"
                 >
                   {a.nombre}
                 </button>
@@ -363,7 +350,7 @@ function ChatThreadPage() {
           )}
 
           {step === "esperando_factura" && !busy && (
-            <div className="pl-10">
+            <div className="pl-0 md:pl-10">
               <button
                 onClick={() => fileRef.current?.click()}
                 className="flex items-center gap-2 rounded-full border border-blue-300 bg-white/90 px-4 py-1.5 text-sm font-medium text-blue-700 hover:bg-blue-50 backdrop-blur-sm shadow-sm"
@@ -374,18 +361,18 @@ function ChatThreadPage() {
           )}
 
           {busy && (
-            <div className="flex items-center gap-2 text-sm text-muted-foreground bg-white/80 backdrop-blur-sm rounded-lg px-4 py-2 w-fit">
+            <div className="flex items-center gap-2 text-sm text-muted-foreground bg-white/80 backdrop-blur-sm rounded-lg px-3 py-2 w-fit">
               <div className="flex h-5 w-5 items-center justify-center rounded-[6px] text-white" style={{ background: 'linear-gradient(135deg, #1a56db, #1e3a8a)' }}>
                 <Bot className="h-3 w-3" />
               </div>
-              InvoBot está leyendo la factura…
+              <span className="text-xs md:text-sm">InvoBot está leyendo la factura…</span>
               <Loader2 className="h-3 w-3 animate-spin" />
             </div>
           )}
         </div>
       </div>
 
-      <form onSubmit={onSubmit} className="border-t bg-background px-6 py-4">
+      <form onSubmit={onSubmit} className="border-t bg-background px-3 md:px-6 py-3 md:py-4">
         <div className="mx-auto flex max-w-3xl items-end gap-2">
           <input
             ref={fileRef}
@@ -397,11 +384,11 @@ function ChatThreadPage() {
               if (f) handleFile(f).finally(() => { if (fileRef.current) fileRef.current.value = ""; });
             }}
           />
-          <Button type="button" variant="outline" size="icon" onClick={() => fileRef.current?.click()} disabled={busy} aria-label="Adjuntar factura">
+          <Button type="button" variant="outline" size="icon" onClick={() => fileRef.current?.click()} disabled={busy} aria-label="Adjuntar factura" className="shrink-0">
             <Paperclip className="h-4 w-4" />
           </Button>
-          <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="Escribe un mensaje o adjunta una factura…" disabled={busy} />
-          <Button type="submit" disabled={busy} aria-label="Enviar">
+          <Input value={text} onChange={(e) => setText(e.target.value)} placeholder="Escribe un mensaje…" disabled={busy} className="text-sm" />
+          <Button type="submit" disabled={busy} aria-label="Enviar" className="shrink-0">
             <Send className="h-4 w-4" />
           </Button>
         </div>
@@ -413,22 +400,22 @@ function ChatThreadPage() {
 function Bubble({ m }: { m: ChatMessage }) {
   const isUser = m.role === "user";
   return (
-    <div className={cn("flex gap-3", isUser ? "justify-end" : "justify-start")}>
+    <div className={cn("flex gap-2 md:gap-3", isUser ? "justify-end" : "justify-start")}>
       {!isUser && (
-        <div className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-[8px] text-white" style={{ background: 'linear-gradient(135deg, #1a56db, #1e3a8a)' }}>
-          <Bot className="h-4 w-4" />
+        <div className="mt-1 flex h-6 w-6 md:h-7 md:w-7 shrink-0 items-center justify-center rounded-[8px] text-white" style={{ background: 'linear-gradient(135deg, #1a56db, #1e3a8a)' }}>
+          <Bot className="h-3 w-3 md:h-4 md:w-4" />
         </div>
       )}
-      <div className="max-w-[80%] space-y-2">
+      <div className="max-w-[85%] md:max-w-[80%] space-y-1 md:space-y-2">
         {m.attachment && (
-          <div className={cn("inline-flex items-center gap-2 rounded-md border bg-white/90 backdrop-blur-sm px-3 py-2 text-xs", isUser && "ml-auto")}>
-            <FileText className="h-4 w-4 text-primary" />
-            <span className="font-medium">{m.attachment.filename}</span>
-            <span className="text-muted-foreground">{(m.attachment.size / 1024).toFixed(1)} KB</span>
+          <div className={cn("inline-flex items-center gap-2 rounded-md border bg-white/90 backdrop-blur-sm px-2 py-1.5 text-xs", isUser && "ml-auto")}>
+            <FileText className="h-3 w-3 md:h-4 md:w-4 text-primary shrink-0" />
+            <span className="font-medium truncate max-w-[150px] md:max-w-none">{m.attachment.filename}</span>
+            <span className="text-muted-foreground shrink-0">{(m.attachment.size / 1024).toFixed(1)} KB</span>
           </div>
         )}
         <div className={cn(
-          "whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm shadow-sm",
+          "whitespace-pre-wrap rounded-2xl px-3 py-2 text-xs md:text-sm shadow-sm",
           isUser
             ? "bg-primary text-primary-foreground"
             : "bg-white/90 backdrop-blur-sm text-foreground",
@@ -437,8 +424,8 @@ function Bubble({ m }: { m: ChatMessage }) {
         </div>
       </div>
       {isUser && (
-        <div className="mt-1 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
-          <UserIcon className="h-4 w-4" />
+        <div className="mt-1 flex h-6 w-6 md:h-7 md:w-7 shrink-0 items-center justify-center rounded-full bg-muted text-muted-foreground">
+          <UserIcon className="h-3 w-3 md:h-4 md:w-4" />
         </div>
       )}
     </div>

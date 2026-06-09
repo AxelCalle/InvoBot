@@ -53,7 +53,7 @@ export const threadsStore = {
     const now = Date.now();
     const thread: ChatThread = {
       id: crypto.randomUUID(),
-      title: "New conversation",
+      title: "Nueva conversación",
       createdAt: now,
       updatedAt: now,
       messages: [],
@@ -77,8 +77,9 @@ export const threadsStore = {
       messages: [...thread.messages, message],
       updatedAt: Date.now(),
       title:
-        thread.messages.length === 0 && message.role === "user" && message.attachment
-          ? message.attachment.filename.slice(0, 40)
+        message.role === "user" && message.attachment && 
+        (thread.title === "Nueva conversación" || thread.title === "New conversation" || thread.title === "Sin título")
+          ? message.attachment.filename.replace(/\.[^/.]+$/, "").slice(0, 40)
           : thread.title,
     };
     threads[idx] = updated;

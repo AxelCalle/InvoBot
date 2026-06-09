@@ -1,6 +1,6 @@
 import { createContext, useContext, useState, useEffect, type ReactNode } from "react";
 
-const BACKEND_URL = "http://localhost:3001";
+const BACKEND_URL =  "http://localhost:3001" //(import.meta.env.VITE_BACKEND_URL || "http://localhost:3001").replace(/\/$/, "");
 
 export interface User {
   id: number;
