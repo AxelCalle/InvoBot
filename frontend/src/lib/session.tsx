@@ -1,8 +1,10 @@
 import { useEffect, useRef, useCallback } from "react";
 import { toast } from "sonner";
 
-const INACTIVIDAD_MS = 5 * 60 * 1000; // 5 minutos
-const AVISO_MS = 3 * 60 * 1000;       // aviso a los 3 minutos
+const INACTIVIDAD_MS = 30 * 60 * 1000; // 30 minutos
+const AVISO_MS = 25 * 60 * 1000; // aviso a los 25 minutos (5 min antes de expirar)
+const GRACIA_MS = INACTIVIDAD_MS - AVISO_MS; // tiempo restante tras el aviso
+const GRACIA_MIN = Math.round(GRACIA_MS / 60000);
 
 export function useSessionTimeout(onExpire: () => void) {
   const timerExpire = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -16,14 +18,14 @@ export function useSessionTimeout(onExpire: () => void) {
 
     timerAviso.current = setTimeout(() => {
       toastId.current = toast.warning(
-        "Tu sesión expirará en 2 minutos por inactividad. Haz clic aquí para continuar.",
+        `Tu sesión expirará en ${GRACIA_MIN} minutos por inactividad. Haz clic aquí para continuar.`,
         {
-          duration: 120000,
+          duration: GRACIA_MS,
           action: {
             label: "Continuar sesión",
             onClick: () => resetTimers(),
           },
-        }
+        },
       );
     }, AVISO_MS);
 

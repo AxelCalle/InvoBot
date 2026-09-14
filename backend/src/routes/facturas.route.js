@@ -2,59 +2,272 @@ const express = require('express');
 const router = express.Router();
 const multer = require('multer');
 const claude = require('../services/claude.service');
-const { registrarFactura, checkDuplicate } = require('../services/sqlserver.service');
+const { registrarFactura, checkDuplicate, getConfigContable, asientosTableName } = require('../services/sqlserver.service');
+const { registrarCompraGF, checkDuplicateGF, resolverPeriodoGF } = require('../services/compras.service');
+const sunat = require('../services/sunat.service');
+const qr = require('../services/qr.service');
 const logger = require('../utils/logger');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { getPool } = require('../config/database');
+
+// Lista de conexiones en uso (una por servidor distinto configurado en `empresas`),
+// para que las pantallas de listar/ver/eliminar busquen en todos los servidores
+// donde puede haber quedado guardado un documento (no solo el principal).
+async function getConexionesActivas() {
+  const mssql = require('mssql');
+  const pool = await getPool();
+  const result = await pool.request()
+    .query("SELECT DISTINCT conexion FROM empresas WHERE conexion IS NOT NULL AND conexion <> ''");
+  const conexiones = result.recordset.map(r => r.conexion);
+  return conexiones.length > 0 ? conexiones : ['DEFAULT'];
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 15 * 1024 * 1024 },
+  limits: { fileSize: 20 * 1024 * 1024 }, // alineado con el límite comunicado en el frontend
   fileFilter: (req, file, cb) => {
     const allowed = ['image/jpeg', 'image/png', 'application/pdf', 'text/xml', 'application/xml'];
     allowed.includes(file.mimetype) ? cb(null, true) : cb(new Error(`Formato no soportado: ${file.mimetype}`));
   },
 });
 
+// Toda la API de facturas requiere sesión iniciada.
+router.use(requireAuth);
+
 router.post('/', upload.single('factura'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo.' });
 
-  const usuario = req.body.usuario || 'BOT';
-  logger.info('Factura recibida', { filename: req.file.originalname, mimeType: req.file.mimetype });
+  const usuario       = req.body.usuario       || 'BOT';
+  const empresaCodigo = (req.body.empresa_codigo || '').toUpperCase().trim();
+  const conceptoId    = req.body.concepto_gasto_id ? parseInt(req.body.concepto_gasto_id, 10) : null;
+  const areaId        = req.body.area_id ? parseInt(req.body.area_id, 10) : null;
+  const esGF          = empresaCodigo === 'GF';
+  logger.info('Factura recibida', { filename: req.file.originalname, mimeType: req.file.mimetype, empresa: empresaCodigo });
+
+  // Período contable elegido en el frontend (solo aplica a Global Factoring por ahora).
+  // Se valida ANTES de llamar a Claude para no gastar la extracción si el período no
+  // es válido (ej. el usuario intenta registrar un mes ya cerrado, o pasado el día 10).
+  let periodoGF = null;
+  if (esGF && req.body.periodo) {
+    const resuelto = resolverPeriodoGF(req.body.periodo);
+    if (resuelto.error) {
+      return res.status(422).json({ error: resuelto.error, motivo: 'PERIODO_INVALIDO' });
+    }
+    periodoGF = resuelto.yyyymm;
+  }
 
   try {
-    const comprobante = await claude.extractFromDocument(req.file.buffer, req.file.mimetype);
+    // Algunas empresas (ej. Global Go) registran sus asientos en un servidor de base de
+    // datos distinto al principal. La tabla `empresas` (que siempre vive en la conexión
+    // por defecto) indica con qué conexión con nombre debe hablar el resto del proceso.
+    const mssqlLib = require('mssql');
+    const poolDefault = await getPool();
+    const empresaRow = await poolDefault.request()
+      .input('codigo', mssqlLib.VarChar, empresaCodigo)
+      .query('SELECT conexion FROM empresas WHERE codigo = @codigo');
+    const conexion = empresaRow.recordset[0]?.conexion || 'DEFAULT';
+    // Intentar decodificar QR si es imagen
+    let datosQR = null;
+    if (req.file.mimetype === 'image/jpeg' || req.file.mimetype === 'image/png') {
+      const textoQR = await qr.decodeQRFromImage(req.file.buffer);
+      if (textoQR) {
+        datosQR = qr.parsearQRSunat(textoQR);
+        logger.info('QR detectado en imagen', { fuente: datosQR?.fuente });
+      }
+    }
+
+    const comprobante = await claude.extractFromDocument(req.file.buffer, req.file.mimetype, datosQR);
+
+    logger.info('Datos extraídos por Claude', {
+      serie: comprobante.serie,
+      numero: comprobante.numero,
+      ruc: comprobante.emisor?.ruc,
+      tipo: comprobante.tipo_comprobante,
+      confianza: comprobante.confianza,
+      total: comprobante.importes?.total,
+    });
 
     if (!comprobante.numero || !comprobante.emisor?.ruc) {
       return res.status(422).json({ error: 'No se pudieron extraer los datos mínimos.', confianza: comprobante.confianza });
     }
 
-    const isDuplicate = await checkDuplicate(comprobante.serie, comprobante.numero, comprobante.emisor.ruc);
+
+    // Verificar duplicado según destino
+    const isDuplicate = esGF
+      ? await checkDuplicateGF(comprobante.serie, comprobante.numero, comprobante.emisor.ruc)
+      : await checkDuplicate(comprobante.serie, comprobante.numero, comprobante.emisor.ruc, conexion);
     if (isDuplicate) {
       return res.status(409).json({ error: `El comprobante ${comprobante.serie}-${comprobante.numero} ya fue registrado.` });
     }
 
-    const resultado = await registrarFactura(comprobante, usuario);
-    const sunatActivo = resultado.sunat?.activo !== false;
+    // Validar emisor en SUNAT (solo facturas nacionales)
+    const validacionSunat = await sunat.validarEmisorNacional(comprobante);
+    if (!validacionSunat.proceder) {
+      return res.status(422).json({
+        error: validacionSunat.mensajeUsuario.replace(/\*/g, ''),
+        motivo: validacionSunat.motivo,
+        ruc: comprobante.emisor?.ruc,
+      });
+    }
+
+    // Validar comprobante en API oficial SUNAT (si está configurada)
+    let validacionComprobante = null;
+    if (process.env.SUNAT_CLIENT_ID && process.env.SUNAT_RUC_CONSULTANTE) {
+      validacionComprobante = await sunat.validarComprobanteOficial(comprobante);
+
+      // null = SUNAT no alcanzable (sin internet / timeout) → bloquear
+      if (validacionComprobante === null) {
+        return res.status(422).json({
+          error: `❌ No se pudo verificar el comprobante en SUNAT\n\nEl servicio de SUNAT no está disponible en este momento. Verifica tu conexión a internet e intenta nuevamente.`,
+          motivo: 'SUNAT_NO_DISPONIBLE',
+        });
+      }
+
+      // omitido: true = comprobante extranjero o sin datos suficientes → pasar sin validar
+      if (!validacionComprobante.omitido) {
+        // Verificar estado del comprobante primero — solo ACEPTADO(1) o AUTORIZADO(3).
+        // Cuando el documento NO EXISTE en SUNAT, los campos de estado del contribuyente
+        // (estadoRuc/condDomi) vienen vacíos (no es que esté inactivo, es que SUNAT no
+        // encontró el documento y no llenó esos campos) — por eso esta validación va
+        // antes que la del contribuyente, para no mostrar un mensaje equivocado.
+        if (!validacionComprobante.valido) {
+          const mensajes = {
+            '0': `❌ Comprobante NO EXISTE en SUNAT\n\nEl documento ${comprobante.serie}-${comprobante.numero} no fue informado a SUNAT. Verifica que el número y la fecha sean correctos.`,
+            '2': `❌ Comprobante ANULADO en SUNAT\n\nEl documento ${comprobante.serie}-${comprobante.numero} fue dado de baja. No se puede registrar un comprobante anulado.`,
+            '4': `❌ Comprobante NO AUTORIZADO en SUNAT\n\nEl documento ${comprobante.serie}-${comprobante.numero} no fue autorizado. No es un comprobante válido.`,
+          };
+          const mensaje = mensajes[validacionComprobante.estadoCp]
+            || `❌ Comprobante rechazado por SUNAT\n\nEstado: ${validacionComprobante.estadoCpTexto}. Solo se aceptan comprobantes ACEPTADOS o AUTORIZADOS.`;
+
+          return res.status(422).json({
+            error: mensaje,
+            motivo: 'COMPROBANTE_RECHAZADO_SUNAT',
+            estadoCp: validacionComprobante.estadoCpTexto,
+          });
+        }
+
+        // Verificar estado del contribuyente
+        if (!validacionComprobante.contribuyenteActivo) {
+          return res.status(422).json({
+            error: `❌ Contribuyente NO ACTIVO en SUNAT\n\nEl emisor RUC ${comprobante.emisor?.ruc} figura con estado "${validacionComprobante.estadoRucTexto}". No se puede registrar comprobantes de un emisor inactivo.`,
+            motivo: 'CONTRIBUYENTE_INACTIVO',
+            estadoRuc: validacionComprobante.estadoRucTexto,
+          });
+        }
+
+        if (!validacionComprobante.contribuyenteHabido) {
+          return res.status(422).json({
+            error: `❌ Contribuyente NO HABIDO en SUNAT\n\nEl emisor RUC ${comprobante.emisor?.ruc} figura como "${validacionComprobante.condDomiTexto}". SUNAT no puede ubicarlo en su domicilio fiscal.`,
+            motivo: 'CONTRIBUYENTE_NO_HABIDO',
+            condDomi: validacionComprobante.condDomiTexto,
+          });
+        }
+      }
+    }
+
+    // ── Resolver cuentas del concepto de gasto + centro de costo del área ──────
+    const contab = await getConfigContable(conceptoId, areaId);
+    contab.conceptoId = conceptoId;
+    logger.info('Config contable', { conceptoId, areaId, ...contab });
+
+    // ── Registrar según empresa ───────────────────────────────────────────────
+    let resultado;
+    if (esGF) {
+      resultado = await registrarCompraGF(comprobante, usuario, contab, validacionSunat.datos, periodoGF);
+    } else {
+      resultado = await registrarFactura(comprobante, usuario, contab, conexion, validacionSunat.datos);
+    }
+
+    // Construir estado de validación para la respuesta
+    let estadoValidacion = 'NO_CONFIGURADO';
+    let mensajeValidacion = null;
+    if (validacionSunat.advertencia) {
+      estadoValidacion = 'NO_DISPONIBLE';
+      mensajeValidacion = validacionSunat.advertencia.replace(/\*/g, '');
+    } else if (validacionComprobante?.omitido || validacionComprobante?.valido || !process.env.SUNAT_CLIENT_ID) {
+      estadoValidacion = 'OK';
+    }
+
+    const serieNumero = comprobante.serie && comprobante.serie !== 'null'
+      ? `${comprobante.serie}-${comprobante.numero}`
+      : `${comprobante.numero}`;
+
+    // ── Bitácora interna (factura_empresa_area) ───────────────────────────────
+    // Registro propio de InvoBot con TODOS los datos, independiente de las tablas
+    // que consume SIG Advance (COMPRAS_GF/asientos_contables).
+    try {
+      const mssql = require('mssql');
+      const pool = await getPool();
+      const empRow = await pool.request().input('cod', mssql.VarChar, empresaCodigo)
+        .query('SELECT id FROM empresas WHERE codigo = @cod');
+      const empresaId = empRow.recordset[0]?.id || null;
+      const tipoMap = { FACTURA: '01', RECIBO_HONORARIOS: '02', BOLETA: '03', NOTA_CREDITO: '07', NOTA_DEBITO: '08', RECIBO_SERVICIOS_PUBLICOS: '14', RECIBO_ARRENDAMIENTO: '10' };
+      const imp = comprobante.importes || {};
+      const tc = comprobante.moneda === 'USD' ? 3.70 : 1;
+      const vouBit = esGF ? resultado.comCod : resultado.voucher;
+      // Fecha de registro siempre a las 00:00:00 (mismo criterio que ComFReg/CPFReg/AFECHA) —
+      // como literal SQL fijo para evitar el desfase de zona horaria del objeto Date de JS.
+      const ahora = new Date();
+      const hoyStr = `${ahora.getFullYear()}-${String(ahora.getMonth() + 1).padStart(2, '0')}-${String(ahora.getDate()).padStart(2, '0')}`;
+      const FECHA_HOY_SQL = `CAST('${hoyStr}T00:00:00.000' AS DATETIME)`;
+      await pool.request()
+        .input('vou', mssql.VarChar, vouBit)
+        .input('empresa_id', mssql.Int, empresaId)
+        .input('area_id', mssql.Int, areaId)
+        .input('concepto_gasto_id', mssql.SmallInt, conceptoId)
+        .input('monto', mssql.Decimal(18, 2), imp.total || 0)
+        .input('moneda', mssql.VarChar, comprobante.moneda || 'PEN')
+        .input('proveedor_ruc', mssql.VarChar, comprobante.emisor?.ruc || null)
+        .input('proveedor_nombre', mssql.VarChar, (comprobante.emisor?.razon_social || '').substring(0, 200) || null)
+        .input('tipo_doc', mssql.VarChar, tipoMap[comprobante.tipo_comprobante] || null)
+        .input('serie', mssql.VarChar, comprobante.serie || null)
+        .input('numero', mssql.VarChar, comprobante.numero || null)
+        .input('fecha_emision', mssql.DateTime, comprobante.fecha_emision ? new Date(comprobante.fecha_emision) : null)
+        .input('fecha_vcto', mssql.DateTime, comprobante.fecha_vencimiento ? new Date(comprobante.fecha_vencimiento) : null)
+        .input('tipo_cambio', mssql.Decimal(10, 4), tc)
+        .input('subtotal', mssql.Decimal(18, 2), imp.op_gravadas || 0)
+        .input('igv', mssql.Decimal(18, 2), imp.igv || 0)
+        .input('total', mssql.Decimal(18, 2), imp.total || 0)
+        .input('cuenta_debe', mssql.VarChar, contab.cuentaGasto || null)
+        .input('centro_costo', mssql.VarChar, contab.centroCosto || null)
+        .input('usuario', mssql.VarChar, usuario.substring(0, 30))
+        .input('destino', mssql.VarChar, esGF ? 'COMPRAS_GF' : 'asientos_contables')
+        .query(`INSERT INTO factura_empresa_area
+          (vou, empresa_id, area_id, concepto_gasto_id, monto, moneda, proveedor_ruc, proveedor_nombre,
+           tipo_doc, serie, numero, fecha_emision, fecha_vcto, tipo_cambio, subtotal, igv, total,
+           cuenta_debe, centro_costo, usuario, destino, fecha_registro)
+          VALUES (@vou,@empresa_id,@area_id,@concepto_gasto_id,@monto,@moneda,@proveedor_ruc,@proveedor_nombre,
+           @tipo_doc,@serie,@numero,@fecha_emision,@fecha_vcto,@tipo_cambio,@subtotal,@igv,@total,
+           @cuenta_debe,@centro_costo,@usuario,@destino,${FECHA_HOY_SQL})`);
+      logger.info('Bitácora registrada', { vou: vouBit, empresaId, areaId, conceptoId });
+    } catch (bitErr) {
+      logger.warn('No se pudo registrar en bitácora', { error: bitErr.message });
+    }
 
     res.json({
       ok: true,
       mensaje: '✅ Comprobante registrado correctamente',
-      voucher: resultado.voucher,
-      numero: comprobante.serie && comprobante.serie !== 'null' 
-              ? `${comprobante.serie}-${comprobante.numero}` 
-              : `${comprobante.numero}`,
-      sunat: resultado.sunat,
-      advertencia_sunat: !sunatActivo ? `⚠️ El proveedor RUC ${comprobante.emisor?.ruc} figura como ${resultado.sunat?.estado} en SUNAT.` : null,
+      voucher: esGF ? resultado.comCod : resultado.voucher,
+      numero: serieNumero,
+      destino: esGF ? 'COMPRAS_GF' : 'asientos_contables',
+      sunat: resultado.sunat ?? null,
+      validacion_sunat: {
+        estado: estadoValidacion,
+        estadoCp: validacionComprobante?.estadoCpTexto || null,
+        estadoRuc: validacionComprobante?.estadoRuc || null,
+      },
+      advertencia_sunat: mensajeValidacion,
       resumen: {
         tipo: comprobante.tipo_comprobante,
-        serie_numero:comprobante.serie && comprobante.serie !== 'null' 
-              ? `${comprobante.serie}-${comprobante.numero}` 
-              : `${comprobante.numero}`,
+        serie_numero: serieNumero,
         fecha: comprobante.fecha_emision,
         emisor: comprobante.emisor?.razon_social,
         ruc: comprobante.emisor?.ruc,
+        total: comprobante.importes?.total || 0,
         moneda: comprobante.moneda,
         confianza: comprobante.confianza,
-        asientos_generados: resultado.asientos,
+        asientos_generados: esGF ? 0 : resultado.asientos,
+        destino: esGF ? 'Global Factoring — pendiente contabilizar' : 'asientos_contables',
       },
     });
   } catch (err) {
@@ -65,62 +278,64 @@ router.post('/', upload.single('factura'), async (req, res) => {
 
 router.get('/', async (req, res) => {
   try {
-    const jwt = require('jsonwebtoken');
-    const JWT_SECRET = process.env.JWT_SECRET || 'invoicegg_secret_2026';
-    const token = req.headers.authorization?.replace('Bearer ', '');
-
-    let rol = 'usuario';
-    let userEmail = '';
-
-    if (token) {
-      try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        rol = decoded.rol || 'usuario';
-        userEmail = decoded.email || '';
-      } catch {}
-    }
-
     const mssql = require('mssql');
-    const pool = await mssql.connect({
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DATABASE,
-      server: process.env.SQL_SERVER?.split('\\')[0],
-      options: { instanceName: process.env.SQL_SERVER?.split('\\')[1], trustServerCertificate: true, enableArithAbort: true },
-    });
 
-    const usuario = userEmail.split('@')[0].substring(0, 3).toUpperCase();
+    const rol = req.user.rol || 'usuario';
+    const usuario = (req.user.email || '').split('@')[0].substring(0, 3).toUpperCase();
     const pagina = parseInt(req.query.pagina) || 1;
     const porPagina = parseInt(req.query.porPagina) || 20;
+
+    // Los filtros (WHERE) son los mismos sin importar la conexión — se arman una
+    // sola vez aquí; `buildRequest` solo agrega los valores (@input) a cada request.
+    const whereParts = ['HABER > 0'];
+    if (rol !== 'admin')       whereParts.push('AUSER LIKE @usuario');
+    if (req.query.ruc)        whereParts.push('RUT LIKE @ruc');
+    if (req.query.numero)     whereParts.push('NUMERO LIKE @numero');
+    if (req.query.fechaDesde) whereParts.push('FECHAD >= @fechaDesde');
+    if (req.query.fechaHasta) whereParts.push('FECHAD <= @fechaHasta');
+    const where = 'WHERE ' + whereParts.join(' AND ');
+
+    const buildRequest = (pool) => {
+      const request = pool.request();
+      if (rol !== 'admin')       request.input('usuario', mssql.VarChar, `${usuario}%`);
+      if (req.query.ruc)        request.input('ruc', mssql.VarChar, `%${req.query.ruc}%`);
+      if (req.query.numero)     request.input('numero', mssql.VarChar, `%${req.query.numero}%`);
+      if (req.query.fechaDesde) request.input('fechaDesde', mssql.VarChar, req.query.fechaDesde);
+      if (req.query.fechaHasta) request.input('fechaHasta', mssql.VarChar, req.query.fechaHasta);
+      return request;
+    };
+
+    // Cada empresa puede vivir en un servidor/tabla distinto (ver `conexion` en
+    // `empresas`) — se consulta cada uno y se combinan los resultados, en vez de
+    // asumir que todo vive en la tabla principal. Se ordena por AFECHA (no por ID,
+    // que no todas las tablas de destino tienen) y se limita a 2000 filas por
+    // conexión antes de paginar en memoria.
+    const conexiones = await getConexionesActivas();
+    let filas = [];
+    for (const conexion of conexiones) {
+      try {
+        const pool = await getPool(conexion);
+        const tabla = asientosTableName(conexion);
+        const result = await buildRequest(pool).query(`
+          SELECT TOP 2000 MTV, VOU, GLOSA, NUMERO, FECHA, RUT, MONEDA, NETO, IGV,
+            HABER AS TOTAL, SERIE, AUSER, AFECHA
+          FROM ${tabla} ${where}
+          ORDER BY AFECHA DESC
+        `);
+        filas = filas.concat(result.recordset);
+      } catch (err) {
+        logger.warn('No se pudo listar facturas de una conexión', { conexion, error: err.message });
+      }
+    }
+    filas.sort((a, b) => new Date(b.AFECHA) - new Date(a.AFECHA));
+
+    const total = filas.length;
     const offset = (pagina - 1) * porPagina;
-    const buscarRuc = req.query.ruc || '';
-    const buscarFechaDesde = req.query.fechaDesde || '';
-    const buscarFechaHasta = req.query.fechaHasta || '';
-    const buscarNumero = req.query.numero || '';
-
-    let where = 'WHERE HABER > 0';
-    if (rol !== 'admin') where += ` AND AUSER LIKE '${usuario}%'`;
-    if (buscarRuc) where += ` AND RUT LIKE '%${buscarRuc}%'`;
-    if (buscarNumero) where += ` AND NUMERO LIKE '%${buscarNumero}%'`;
-    if (buscarFechaDesde) where += ` AND FECHAD >= '${buscarFechaDesde}'`;
-    if (buscarFechaHasta) where += ` AND FECHAD <= '${buscarFechaHasta}'`;
-
-    const countResult = await pool.request().query(
-      `SELECT COUNT(*) AS total FROM asientos_contables ${where}`
-    );
-    const total = countResult.recordset[0].total;
-
-    const result = await pool.request().query(`
-      SELECT MTV, VOU, GLOSA, NUMERO, FECHA, RUT, MONEDA, NETO, IGV,
-        HABER AS TOTAL, SERIE, AUSER, AFECHA
-      FROM asientos_contables ${where}
-      ORDER BY ID DESC
-      OFFSET ${offset} ROWS FETCH NEXT ${porPagina} ROWS ONLY
-    `);
+    const pageRows = filas.slice(offset, offset + porPagina);
 
     res.json({
       ok: true,
-      facturas: result.recordset,
+      facturas: pageRows,
       rol,
       paginacion: {
         total,
@@ -130,20 +345,15 @@ router.get('/', async (req, res) => {
       }
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    logger.error('Error listando facturas', { error: err.message });
+    res.status(500).json({ error: 'Error al listar las facturas.' });
   }
 });
 
 router.get('/empresas', async (req, res) => {
   try {
     const mssql = require('mssql');
-    const pool = await mssql.connect({
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DATABASE,
-      server: process.env.SQL_SERVER?.split('\\')[0],
-      options: { instanceName: process.env.SQL_SERVER?.split('\\')[1], trustServerCertificate: true, enableArithAbort: true },
-    });
+    const pool = await getPool();
     const result = await pool.request().query('SELECT id, codigo, nombre FROM empresas WHERE activo = 1 ORDER BY nombre');
     res.json({ ok: true, empresas: result.recordset });
   } catch (err) {
@@ -154,15 +364,32 @@ router.get('/empresas', async (req, res) => {
 router.get('/areas', async (req, res) => {
   try {
     const mssql = require('mssql');
-    const pool = await mssql.connect({
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DATABASE,
-      server: process.env.SQL_SERVER?.split('\\')[0],
-      options: { instanceName: process.env.SQL_SERVER?.split('\\')[1], trustServerCertificate: true, enableArithAbort: true },
-    });
+    const pool = await getPool();
     const result = await pool.request().query('SELECT id, codigo, nombre FROM areas WHERE activo = 1 ORDER BY nombre');
     res.json({ ok: true, areas: result.recordset });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/conceptos-gasto', async (req, res) => {
+  try {
+    const mssql = require('mssql');
+    const pool = await getPool();
+    const empresaId = req.query.empresa_id ? parseInt(req.query.empresa_id, 10) : null;
+
+    const request = pool.request();
+    let where = 'WHERE Activo_ConcepGasto = 1';
+    if (empresaId) {
+      request.input('empresaId', mssql.Int, empresaId);
+      where += ' AND empresa_id = @empresaId';
+    }
+
+    const result = await request.query(
+      `SELECT Id_ConcepGasto AS id, Nombre_ConcepGasto AS nombre, Cuenta_ConcepGasto AS cuenta, Descripcion_Cuenta AS descripcion
+       FROM ConceptoGasto ${where} ORDER BY Nombre_ConcepGasto`
+    );
+    res.json({ ok: true, conceptos: result.recordset });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -171,13 +398,7 @@ router.get('/areas', async (req, res) => {
 router.get('/presupuesto/:empresaId/:areaId', async (req, res) => {
   try {
     const mssql = require('mssql');
-    const pool = await mssql.connect({
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DATABASE,
-      server: process.env.SQL_SERVER?.split('\\')[0],
-      options: { instanceName: process.env.SQL_SERVER?.split('\\')[1], trustServerCertificate: true, enableArithAbort: true },
-    });
+    const pool = await getPool();
     const fecha = new Date();
     const anio = fecha.getFullYear();
     const mes = fecha.getMonth() + 1;
@@ -222,20 +443,22 @@ router.get('/presupuesto/:empresaId/:areaId', async (req, res) => {
 router.get('/total/:numero', async (req, res) => {
   try {
     const mssql = require('mssql');
-    const pool = await mssql.connect({
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DATABASE,
-      server: process.env.SQL_SERVER?.split('\\')[0],
-      options: { instanceName: process.env.SQL_SERVER?.split('\\')[1], trustServerCertificate: true, enableArithAbort: true },
-    });
-    const result = await pool.request()
-      .input('numero', mssql.VarChar, req.params.numero)
-      .query(`SELECT SUM(HABER) AS total, MAX(MONEDA) AS moneda 
-              FROM asientos_contables 
-              WHERE NUMERO = @numero AND HABER > 0`);
-    const row = result.recordset[0];
-    res.json({ ok: true, total: row?.total || 0, moneda: row?.moneda || 'S' });
+    // El número puede estar registrado en cualquiera de las conexiones configuradas.
+    const conexiones = await getConexionesActivas();
+    for (const conexion of conexiones) {
+      const pool = await getPool(conexion);
+      const tabla = asientosTableName(conexion);
+      const result = await pool.request()
+        .input('numero', mssql.VarChar, req.params.numero)
+        .query(`SELECT SUM(HABER) AS total, MAX(MONEDA) AS moneda
+                FROM ${tabla}
+                WHERE NUMERO = @numero AND HABER > 0`);
+      const row = result.recordset[0];
+      if (row?.total) {
+        return res.json({ ok: true, total: row.total, moneda: row.moneda || 'S' });
+      }
+    }
+    res.json({ ok: true, total: 0, moneda: 'S' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -246,17 +469,28 @@ router.get('/pdf/:numero', async (req, res) => {
     const mssql = require('mssql');
     const PDFDocument = require('pdfkit');
 
-    const pool = await mssql.connect({
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DATABASE,
-      server: process.env.SQL_SERVER?.split('\\')[0],
-      options: { instanceName: process.env.SQL_SERVER?.split('\\')[1], trustServerCertificate: true, enableArithAbort: true },
-    });
-
-    const result = await pool.request()
-      .input('numero', mssql.VarChar, req.params.numero)
-      .query(`SELECT * FROM asientos_contables WHERE NUMERO = @numero ORDER BY ID ASC`);
+    // El mismo NUMERO puede repetirse entre proveedores distintos (cada uno numera
+    // sus propios documentos), así que además de buscar en todas las conexiones
+    // configuradas, se exige que coincida también el RUT — si no se indica, se
+    // toma el primer resultado que coincida solo por NUMERO (comportamiento previo).
+    const ruc = (req.query.ruc || '').trim();
+    // Se ordena por VOU (no por ID, que no todas las tablas de destino tienen) —
+    // los 3 asientos de un mismo documento se insertan con VOU consecutivo, así
+    // que ordenar por VOU preserva el mismo orden (gasto, IGV, por pagar).
+    const conexiones = await getConexionesActivas();
+    let result = { recordset: [] };
+    for (const conexion of conexiones) {
+      const pool = await getPool(conexion);
+      const tabla = asientosTableName(conexion);
+      const request = pool.request().input('numero', mssql.VarChar, req.params.numero);
+      let where = 'WHERE NUMERO = @numero';
+      if (ruc) {
+        request.input('ruc', mssql.VarChar, ruc);
+        where += ' AND RUT = @ruc';
+      }
+      const r = await request.query(`SELECT * FROM ${tabla} ${where} ORDER BY VOU ASC`);
+      if (r.recordset.length > 0) { result = r; break; }
+    }
 
     if (result.recordset.length === 0) {
       return res.status(404).json({ error: 'Factura no encontrada' });
@@ -350,53 +584,48 @@ router.get('/pdf/:numero', async (req, res) => {
   }
 });
 
-router.post('/vincular', async (req, res) => {
+// NOTA: el antiguo endpoint POST /vincular fue eliminado. La bitácora
+// (factura_empresa_area) ahora se escribe directamente en POST / al registrar,
+// con todos los datos del comprobante.
+
+router.delete('/:vou', requireAdmin, async (req, res) => {
   try {
-    const { vou, empresa_id, area_id, monto, moneda } = req.body;
+    const { vou } = req.params;
     const mssql = require('mssql');
-    const pool = await mssql.connect({
-      user: process.env.SQL_USER,
-      password: process.env.SQL_PASSWORD,
-      database: process.env.SQL_DATABASE,
-      server: process.env.SQL_SERVER?.split('\\')[0],
-      options: { instanceName: process.env.SQL_SERVER?.split('\\')[1], trustServerCertificate: true, enableArithAbort: true },
-    });
-    await pool.request()
+
+    // El VOU es único dentro de cada conexión, pero para evitar borrar el documento
+    // equivocado si por coincidencia el mismo VOU existiera en dos conexiones
+    // distintas, se exige también que coincida el RUT cuando se indica.
+    const ruc = (req.query.ruc || '').trim();
+    const conexiones = await getConexionesActivas();
+    for (const conexion of conexiones) {
+      const pool = await getPool(conexion);
+      const tabla = asientosTableName(conexion);
+      const request = pool.request().input('vou', mssql.VarChar, vou);
+      let where = 'WHERE VOU = @vou';
+      if (ruc) {
+        request.input('ruc', mssql.VarChar, ruc);
+        where += ' AND RUT = @ruc';
+      }
+      await request.query(`DELETE FROM ${tabla} ${where}`);
+    }
+
+    // Eliminar de la bitácora (siempre vive en la conexión principal)
+    const poolDefault = await getPool();
+    await poolDefault.request()
       .input('vou', mssql.VarChar, vou)
-      .input('empresa_id', mssql.Int, empresa_id)
-      .input('area_id', mssql.Int, area_id)
-      .input('monto', mssql.Decimal(18, 2), monto)
-      .input('moneda', mssql.VarChar, moneda)
-      .query('INSERT INTO factura_empresa_area (vou, empresa_id, area_id, monto, moneda) VALUES (@vou, @empresa_id, @area_id, @monto, @moneda)');
+      .query('DELETE FROM factura_empresa_area WHERE vou = @vou');
+
+    logger.info('Documento eliminado', { vou });
     res.json({ ok: true });
   } catch (err) {
+    logger.error('Error al eliminar documento', { error: err.message });
     res.status(500).json({ error: err.message });
   }
 });
 
-router.get('/validar-ruc/:ruc', async (req, res) => {
-  try {
-    const ruc = req.params.ruc;
-    if (!ruc || ruc.length !== 11) {
-      return res.status(400).json({ error: 'RUC inválido — debe tener 11 dígitos' });
-    }
-    const response = await require('axios').get(
-      `https://api.sunat.cloud/ruc/${ruc}`,
-      { timeout: 5000 }
-    );
-    const data = response.data;
-    res.json({
-      ok: true,
-      ruc: data.ruc,
-      razon_social: data.razon_social || data.nombre,
-      estado: data.estado,
-      condicion: data.condicion,
-      activo: data.estado === 'ACTIVO',
-    });
-  } catch (err) {
-    logger.warn('No se pudo validar RUC en SUNAT', { ruc: req.params.ruc, error: err.message });
-    res.json({ ok: false, advertencia: 'No se pudo validar el RUC en SUNAT. Se procederá con el registro.' });
-  }
-});
+// NOTA: los antiguos endpoints de depuración GET /validar-ruc/:ruc y GET /test-sunat
+// se retiraron antes de producción — no los usa el frontend y exponían la validación
+// SUNAT (cuota/costo) sin ningún propósito operativo.
 
 module.exports = router;

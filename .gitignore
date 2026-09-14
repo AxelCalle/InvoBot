@@ -6,6 +6,9 @@ frontend/node_modules/
 backend/.env
 frontend/.env
 
+# Archivos de prueba locales con credenciales reales — nunca subir
+**/test.json
+
 # Logs
 backend/logs/
 *.log

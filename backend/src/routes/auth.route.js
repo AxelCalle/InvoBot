@@ -5,24 +5,9 @@ const jwt = require('jsonwebtoken');
 const sql = require('mssql');
 const crypto = require('crypto');
 const logger = require('../utils/logger');
-
-const JWT_SECRET = process.env.JWT_SECRET || 'invoicegg_secret_2026';
-
-const sqlConfig = {
-  user: process.env.SQL_USER,
-  password: process.env.SQL_PASSWORD,
-  database: process.env.SQL_DATABASE,
-  server: process.env.SQL_SERVER?.split('\\')[0],
-  options: {
-    instanceName: process.env.SQL_SERVER?.split('\\')[1],
-    trustServerCertificate: true,
-    enableArithAbort: true,
-  },
-};
-
-async function getPool() {
-  return await sql.connect(sqlConfig);
-}
+const { JWT_SECRET } = require('../config/jwt');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { getPool } = require('../config/database');
 
 // POST /api/auth/register
 router.post('/register', async (req, res) => {
@@ -44,8 +29,8 @@ router.post('/register', async (req, res) => {
       .input('email', sql.VarChar, email)
       .input('hash', sql.VarChar, hash)
       .input('nombre', sql.VarChar, nombre || email.split('@')[0])
-      .query(`INSERT INTO usuarios (email, password, nombre) 
-              OUTPUT INSERTED.id, INSERTED.email, INSERTED.nombre
+      .query(`INSERT INTO usuarios (email, password, nombre)
+              OUTPUT INSERTED.id, INSERTED.email, INSERTED.nombre, INSERTED.usuario_gf, INSERTED.usuario_ggo
               VALUES (@email, @hash, @nombre)`);
 
     const user = result.recordset[0];
@@ -64,6 +49,8 @@ router.post('/register', async (req, res) => {
         nombre: user.nombre,
         rol: 'usuario',
         debe_cambiar_password: false,
+        usuario_gf: user.usuario_gf || null,
+        usuario_ggo: user.usuario_ggo || null,
       }
     });
   } catch (err) {
@@ -81,8 +68,8 @@ router.post('/login', async (req, res) => {
     const db = await getPool();
     const result = await db.request()
       .input('email', sql.VarChar, email)
-      .query(`SELECT id, email, password, password_temporal, temporal_expira, 
-              nombre, debe_cambiar_password, rol 
+      .query(`SELECT id, email, password, password_temporal, temporal_expira,
+              nombre, debe_cambiar_password, rol, usuario_gf, usuario_ggo
               FROM usuarios WHERE email = @email AND activo = 1`);
 
     if (result.recordset.length === 0) {
@@ -123,6 +110,8 @@ router.post('/login', async (req, res) => {
         nombre: user.nombre,
         rol: user.rol || 'usuario',
         debe_cambiar_password: user.debe_cambiar_password === true || user.debe_cambiar_password === 1,
+        usuario_gf: user.usuario_gf || null,
+        usuario_ggo: user.usuario_ggo || null,
       }
     });
   } catch (err) {
@@ -144,10 +133,17 @@ router.get('/me', async (req, res) => {
   }
 });
 
-// POST /api/auth/forgot-password
-router.post('/forgot-password', async (req, res) => {
-  const { email } = req.body;
+// POST /api/auth/admin/reset-password
+// Solo un admin autenticado puede resetear la contraseña de otro usuario.
+// La nueva contraseña queda activa de inmediato (reemplaza `password`, no un
+// campo temporal con expiración) — el admin se la comunica al usuario por
+// fuera del sistema (llamada, chat interno, etc).
+router.post('/admin/reset-password', requireAuth, requireAdmin, async (req, res) => {
+  const { email, nuevaPasswordDeseada } = req.body;
   if (!email) return res.status(400).json({ error: 'Email requerido' });
+  if (nuevaPasswordDeseada && nuevaPasswordDeseada.length < 6) {
+    return res.status(400).json({ error: 'La contraseña debe tener al menos 6 caracteres' });
+  }
 
   try {
     const db = await getPool();
@@ -156,34 +152,28 @@ router.post('/forgot-password', async (req, res) => {
       .query('SELECT id, email, nombre FROM usuarios WHERE email = @email AND activo = 1');
 
     if (result.recordset.length === 0) {
-      return res.json({ ok: true, mensaje: 'Si el correo existe, se generó un código temporal.' });
+      return res.status(404).json({ error: 'No existe un usuario activo con ese correo.' });
     }
 
-    const codigo = crypto.randomBytes(4).toString('hex').toUpperCase();
-    const expira = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const hash = await bcrypt.hash(codigo, 10);
+    // Si el admin especificó una contraseña, se usa esa; si no, se genera una aleatoria.
+    const nuevaPassword = nuevaPasswordDeseada || crypto.randomBytes(9).toString('base64url'); // 12 chars, ~72 bits
+    const hash = await bcrypt.hash(nuevaPassword, 10);
 
     await db.request()
       .input('email', sql.VarChar, email)
       .input('hash', sql.VarChar, hash)
-      .input('expira', sql.DateTime, expira)
-      .query(`UPDATE usuarios SET 
-              password_temporal = @hash,
-              temporal_expira = @expira,
+      .query(`UPDATE usuarios SET
+              password = @hash,
+              password_temporal = NULL,
+              temporal_expira = NULL,
               debe_cambiar_password = 1
               WHERE email = @email`);
 
-    logger.info('Código temporal generado', { email });
+    logger.info('Contraseña reseteada por admin', { email, adminId: req.user.id });
 
-    res.json({
-      ok: true,
-      codigo,
-      mensaje: 'Código temporal generado. Válido por 24 horas.',
-      expira: expira.toISOString(),
-    });
-
+    res.json({ ok: true, email, nuevaPassword });
   } catch (err) {
-    logger.error('Error en forgot-password', { error: err.message });
+    logger.error('Error en admin/reset-password', { error: err.message });
     res.status(500).json({ error: 'Error interno' });
   }
 });

@@ -100,6 +100,9 @@ function mapTipoComprobante(tipo) {
     FACTURA: '01',
     NOTA_CREDITO: '07',
     NOTA_DEBITO: '08',
+    RECIBO_HONORARIOS: '02',
+    RECIBO_SERVICIOS_PUBLICOS: '14',
+    RECIBO_ARRENDAMIENTO: '10',
   };
   return mapa[tipo] || '01';
 }

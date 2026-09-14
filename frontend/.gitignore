@@ -20,6 +20,14 @@ dist-ssr
 .wrangler/
 .dev.vars
 
+# Variables de entorno (claves de API, secretos) — nunca subir
+.env
+.env.*
+!.env.example
+
+# Archivo de prueba local con credenciales reales — nunca subir
+test.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

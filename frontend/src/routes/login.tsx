@@ -39,15 +39,23 @@ function LoginPage() {
     <div
       className="flex min-h-screen items-center justify-center px-4"
       style={{
-        backgroundImage: "url('/grupo-global-bg.jpg')",
+        backgroundImage: `url('${import.meta.env.BASE_URL}grupo-global-bg.jpg')`,
         backgroundSize: "cover",
         backgroundPosition: "center",
       }}
     >
       <div className="absolute inset-0 bg-black/50" />
-      <form onSubmit={onSubmit} className="relative z-10 w-full max-w-sm space-y-5 rounded-xl border border-white/10 bg-white/95 p-8 shadow-lg">
+      <form
+        onSubmit={onSubmit}
+        className="relative z-10 w-full max-w-sm space-y-5 rounded-xl border border-white/10 bg-white/95 p-8 shadow-lg"
+      >
         <Link to="/" className="flex items-center gap-2 text-sm font-semibold">
-          <img src="/logo-grupo-global.png" alt="Grupo Global" className="h-8 w-auto" style={{ mixBlendMode: 'multiply' }} />
+          <img
+            src={`${import.meta.env.BASE_URL}logo-grupo-global.png`}
+            alt="Grupo Global"
+            className="h-8 w-auto"
+            style={{ mixBlendMode: "multiply" }}
+          />
           <span>InvoiceGG</span>
         </Link>
         <div>
@@ -56,7 +64,14 @@ function LoginPage() {
         </div>
         <div className="space-y-2">
           <Label htmlFor="email">Correo electrónico</Label>
-          <Input id="email" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="correo@empresa.com" />
+          <Input
+            id="email"
+            type="email"
+            required
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="correo@empresa.com"
+          />
         </div>
         <div className="space-y-2">
           <div className="flex items-center justify-between">
@@ -65,13 +80,22 @@ function LoginPage() {
               ¿Olvidaste tu contraseña?
             </Link>
           </div>
-          <Input id="password" type="password" required value={password} onChange={(e) => setPassword(e.target.value)} />
+          <Input
+            id="password"
+            type="password"
+            required
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
         </div>
         <Button type="submit" className="w-full" disabled={busy}>
           {busy ? "Iniciando sesión…" : "Iniciar sesión"}
         </Button>
         <p className="text-center text-sm text-muted-foreground">
-          ¿No tienes cuenta? <Link to="/signup" className="text-primary hover:underline">Crear una</Link>
+          ¿No tienes cuenta?{" "}
+          <Link to="/signup" className="text-primary hover:underline">
+            Crear una
+          </Link>
         </p>
       </form>
     </div>

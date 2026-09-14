@@ -1,6 +1,8 @@
 const whatsapp = require('./whatsapp.service');
 const claude = require('./claude.service');
 const siscon = require('./siscon.service');
+const qr = require('./qr.service');
+const sunat = require('./sunat.service');
 const config = require('../../config');
 const logger = require('../utils/logger');
 
@@ -56,11 +58,21 @@ async function procesarAdjunto(mensaje) {
     return;
   }
 
-  // 4. Extraer datos con Claude
-  logger.info('Extrayendo datos con Claude', { from });
-  const comprobante = await claude.extractFromDocument(buffer, mimeType);
+  // 4. Intentar decodificar QR si es imagen
+  let datosQR = null;
+  if (mimeType === 'image/jpeg' || mimeType === 'image/png') {
+    const textoQR = await qr.decodeQRFromImage(buffer);
+    if (textoQR) {
+      datosQR = qr.parsearQRSunat(textoQR);
+      await whatsapp.sendMessage(from, '🔍 Código QR detectado, enriqueciendo extracción...');
+    }
+  }
 
-  // 5. Validar que Claude extrajo datos mínimos
+  // 5. Extraer datos con Claude (con contexto QR si existe)
+  logger.info('Extrayendo datos con Claude', { from, conQR: !!datosQR });
+  const comprobante = await claude.extractFromDocument(buffer, mimeType, datosQR);
+
+  // 6. Validar que Claude extrajo datos mínimos
   if (!comprobante.serie || !comprobante.numero || !comprobante.emisor?.ruc) {
     await whatsapp.sendMessage(
       from,
@@ -71,7 +83,7 @@ async function procesarAdjunto(mensaje) {
     return;
   }
 
-  // 6. Advertir si la confianza es baja
+  // 7. Advertir si la confianza es baja
   if (comprobante.confianza === 'BAJA') {
     await whatsapp.sendMessage(
       from,
@@ -79,11 +91,22 @@ async function procesarAdjunto(mensaje) {
     );
   }
 
-  // 7. Registrar en SISCON
+  // 8. Validar emisor en SUNAT (solo facturas nacionales)
+  const validacionSunat = await sunat.validarEmisorNacional(comprobante);
+  if (!validacionSunat.proceder) {
+    logger.warn('Registro bloqueado por validación SUNAT', { from, motivo: validacionSunat.motivo });
+    await whatsapp.sendMessage(from, validacionSunat.mensajeUsuario);
+    return;
+  }
+  if (validacionSunat.advertencia) {
+    await whatsapp.sendMessage(from, validacionSunat.advertencia);
+  }
+
+  // 9. Registrar en SISCON
   logger.info('Registrando en SISCON', { from, serie: comprobante.serie, numero: comprobante.numero });
   const resultado = await siscon.registrarComprobante(comprobante);
 
-  // 8. Confirmar al usuario
+  // 10. Confirmar al usuario
   const resumen = formatResumen(comprobante);
   await whatsapp.sendMessage(from, resumen + `\n\n🗂 Registro SISCON: *${resultado.numero_registro || resultado.id}*`);
 

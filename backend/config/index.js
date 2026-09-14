@@ -18,7 +18,7 @@ module.exports = {
   anthropic: {
     apiKey: process.env.ANTHROPIC_API_KEY || '',
     model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20251001',
-    maxTokens: 1500,
+    maxTokens: 4096,
   },
 
   siscon: {
@@ -35,5 +35,5 @@ module.exports = {
     'application/xml',
   ],
 
-  maxFileSizeMB: 10,
+  maxFileSizeMB: 20,
 };
